@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Node Canvas v2</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #fff;
+            overflow: hidden;
+            font-family: monospace;
+            user-select: none;
+        }
+
+        #canvas {
+            display: block;
+            cursor: crosshair;
+        }
+
+        #toolbar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(255, 255, 255, .96);
+            border-top: 1px solid #d1d5db;
+            display: flex;
+            gap: 6px;
+            padding: 7px 14px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 5px 12px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 12px;
+            font-weight: bold;
+            color: #fff;
+            transition: .12s;
+        }
+
+        .btn:hover {
+            filter: brightness(1.15);
+        }
+
+        #chip-bar {
+            position: fixed;
+            bottom: 44px;
+            left: 0;
+            right: 0;
+            background: rgba(249, 250, 251, .95);
+            border-top: 1px solid #e5e7eb;
+            display: flex;
+            gap: 6px;
+            padding: 4px 14px;
+            align-items: center;
+            min-height: 28px;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="chip-bar">
+        <span style="color:#9ca3af;font-size:11px">CUSTOM:</span>
+    </div>
+    <div id="toolbar">
+        <button class="btn" style="background:#15803d" onclick="addInput()">+ INPUT</button>
+        <button class="btn" style="background:#b45309" onclick="addOutput()">+ OUTPUT</button>
+        <div style="width:1px;height:20px;background:#d1d5db;margin:0 2px"></div>
+        <button class="btn" style="background:#1d4ed8" onclick="place('AND')">AND</button>
+        <button class="btn" style="background:#b91c1c" onclick="place('NOT')">NOT</button>
+        <button class="btn" style="background:#065f46" onclick="place('NAND')">NAND</button>
+        <button class="btn" style="background:#b45309" onclick="place('OR')">OR</button>
+        <button class="btn" style="background:#7c3aed" onclick="place('XOR')">XOR</button>
+        <div style="width:1px;height:20px;background:#d1d5db;margin:0 2px"></div>
+        <button class="btn" style="background:#4c1d95" onclick="saveChip()">SAVE AS CHIP</button>
+        <button class="btn" style="background:#0f766e" onclick="newCanvas()">+ NEW</button>
+        <div style="width:1px;height:20px;background:#d1d5db;margin:0 2px"></div>
+        <button class="btn" style="background:#991b1b" onclick="deleteSelected()">DELETE</button>
+        <span style="color:#9ca3af;font-size:11px;margin-left:auto">Scroll=zoom · MMB=pan · Right-click=menu ·
+            Del=delete</span>
+    </div>
+
+    <script>
+        /* ─── BUILTIN ─────────────────────────────────────────────── */
+        const BUILTIN = {
+            AND: { color: '#1d4ed8', inputs: 2, fn: v => [v[0] & v[1]] },
+            OR: { color: '#b45309', inputs: 2, fn: v => [v[0] | v[1]] },
+            NOT: { color: '#b91c1c', inputs: 1, fn: v => [v[0] ? 0 : 1] },
+            NAND: { color: '#065f46', inputs: 2, fn: v => [(v[0] & v[1]) ? 0 : 1] },
+            XOR: { color: '#7c3aed', inputs: 2, fn: v => [v[0] ^ v[1]] },
+        };
+        const customChips = {};
+
+        /* ─── WORLD STATE ─────────────────────────────────────────── */
+        /*
+          Frame: visible chip-boundary rectangle.
+            frame.inputs  = [ { id, value } ]   — togglable input slots on LEFT edge
+            frame.outputs = [ { id, value } ]   — LED output slots on RIGHT edge
+        
+          Chips: freely-placed gate boxes INSIDE (or anywhere on) the canvas.
+            chip.type, chip.x, chip.y, chip.w, chip.h
+            chip.ins[], chip.outs[]
+        
+          Wires:
+            { from: { kind:'frame-in'|'chip', idx, node, pin },
+              to:   { kind:'frame-out'|'chip', idx, node, pin } }
+        */
+        let nextId = 1;
+        let frame = { x: 0, y: 0, w: 480, h: 300, title: 'ROOT', inputs: [], outputs: [] };
+        let chips = [];
+        let wires = [];
+        let selected = null;   // selected chip
+        let dragChip = null, dragOx = 0, dragOy = 0;
+        let dragFrame = false, dragFx = 0, dragFy = 0, dragFpx = 0, dragFpy = 0, dragChipSnap = [];
+        let wireFrom = null;   // { kind, idx?, node?, pin }
+        let MX = 0, MY = 0;
+
+        let panX = 0, panY = 0, CAM = 1;
+        let isPanning = false, panSX = 0, panSY = 0, panSPX = 0, panSPY = 0;
+
+        const SLOT_H = 44;   // height per input/output slot on frame
+        const SLOT_W = 64;   // width of the in/out tab
+        const FRAME_HEAD = 28;   // title bar height
+        const PIN_R = 6;
+
+        /* ─── HELPERS ────────────────────────────────────────────── */
+        function toWorld(sx, sy) { return { x: (sx - panX) / CAM, y: (sy - panY) / CAM }; }
+        function sig(v) { return v ? '#16a34a' : '#9ca3af'; }
+
+        /* Pin positions in WORLD coords */
+        function frameInPinPos(i) {
+            return { x: frame.x, y: frame.y + FRAME_HEAD + SLOT_H * i + SLOT_H / 2 };
+        }
+        function frameOutPinPos(i) {
+            return { x: frame.x + frame.w, y: frame.y + FRAME_HEAD + SLOT_H * i + SLOT_H / 2 };
+        }
+        function chipInPos(c, i) {
+            const step = c.h / Math.max(c.ins.length, 1);
+            return { x: c.x, y: c.y + step * i + step / 2 };
+        }
+        function chipOutPos(c, i) {
+            const step = c.h / Math.max(c.outs.length, 1);
+            return { x: c.x + c.w, y: c.y + step * i + step / 2 };
+        }
+        function wireFromPos(f) {
+            if (f.kind === 'frame-in') return frameInPinPos(f.idx);
+            return chipOutPos(f.node, f.pin);
+        }
+        function wireToPos(t) {
+            if (t.kind === 'frame-out') return frameOutPinPos(t.idx);
+            return chipInPos(t.node, t.pin);
+        }
+
+        /* ─── SIMULATE ───────────────────────────────────────────── */
+        function simulate() {
+            for (let pass = 0; pass < 12; pass++) {
+                for (const w of wires) {
+                    let val = 0;
+                    if (w.from.kind === 'frame-in') val = frame.inputs[w.from.idx].value;
+                    else val = w.from.node.outs[w.from.pin] || 0;
+                    if (w.to.kind === 'frame-out') frame.outputs[w.to.idx].value = val;
+                    else w.to.node.ins[w.to.pin] = val;
+                }
+                for (const c of chips) {
+                    const def = BUILTIN[c.type] || (customChips[c.type] && { fn: customChips[c.type].fn });
+                    if (def) c.outs = def.fn(c.ins);
+                }
+            }
+        }
+
+        /* ─── CANVAS SETUP ───────────────────────────────────────── */
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            draw();
+        }
+        window.addEventListener('resize', resize);
+
+        /* ─── DRAW FRAME ─────────────────────────────────────────── */
+        function drawFrame() {
+            const { x, y, w, h, title } = frame;
+            const lw = 1.5 / CAM;
+
+            // Shadow
+            ctx.shadowColor = 'rgba(0,0,0,.08)'; ctx.shadowBlur = 16 / CAM;
+            ctx.fillStyle = '#fff';
+            ctx.beginPath(); ctx.roundRect(x, y, w, h, 10); ctx.fill();
+            ctx.shadowBlur = 0;
+
+            // Dashed border
+            ctx.strokeStyle = '#6366f1'; ctx.lineWidth = lw * 1.5;
+            ctx.setLineDash([8 / CAM, 5 / CAM]);
+            ctx.beginPath(); ctx.roundRect(x, y, w, h, 10); ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Title bar
+            ctx.fillStyle = '#6366f1';
+            ctx.beginPath(); ctx.roundRect(x, y, w, FRAME_HEAD, [10, 10, 0, 0]); ctx.fill();
+            ctx.fillStyle = '#fff';
+            ctx.font = `bold ${13 / CAM < 8 ? 8 : 13}px monospace`;
+            ctx.textAlign = 'left';
+            ctx.fillText(title, x + 12, y + FRAME_HEAD / 2 + 5);
+
+            // Input slots (left edge)
+            frame.inputs.forEach((inp, i) => {
+                const py = y + FRAME_HEAD + SLOT_H * i;
+                // tab that sticks out left
+                ctx.fillStyle = inp.value ? '#dcfce7' : '#f1f5f9';
+                ctx.beginPath(); ctx.roundRect(x - SLOT_W, py, SLOT_W, SLOT_H - 2, [6, 0, 0, 6]); ctx.fill();
+                ctx.strokeStyle = '#d1d5db'; ctx.lineWidth = lw;
+                ctx.stroke();
+                // value toggle dot
+                ctx.beginPath(); ctx.arc(x - SLOT_W + 16, py + SLOT_H / 2, 7, 0, Math.PI * 2);
+                ctx.fillStyle = inp.value ? '#16a34a' : '#9ca3af'; ctx.fill();
+                ctx.fillStyle = '#374151';
+                ctx.font = `${10 / CAM < 7 ? 7 : 10}px monospace`; ctx.textAlign = 'center';
+                ctx.fillText('IN' + i, x - SLOT_W / 2, py + SLOT_H / 2 + 4);
+                // pin
+                const p = frameInPinPos(i);
+                ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2);
+                ctx.fillStyle = sig(inp.value); ctx.fill();
+                ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke();
+            });
+
+            // Output slots (right edge)
+            frame.outputs.forEach((out, i) => {
+                const py = y + FRAME_HEAD + SLOT_H * i;
+                ctx.fillStyle = out.value ? '#fef9c3' : '#f1f5f9';
+                ctx.beginPath(); ctx.roundRect(x + w, py, SLOT_W, SLOT_H - 2, [0, 6, 6, 0]); ctx.fill();
+                ctx.strokeStyle = '#d1d5db'; ctx.lineWidth = lw; ctx.stroke();
+                // LED
+                ctx.beginPath(); ctx.arc(x + w + SLOT_W - 16, py + SLOT_H / 2, 7, 0, Math.PI * 2);
+                ctx.fillStyle = out.value ? '#eab308' : '#9ca3af'; ctx.fill();
+                ctx.fillStyle = '#374151';
+                ctx.font = `${10 / CAM < 7 ? 7 : 10}px monospace`; ctx.textAlign = 'center';
+                ctx.fillText('OUT' + i, x + w + SLOT_W / 2, py + SLOT_H / 2 + 4);
+                // pin
+                const p = frameOutPinPos(i);
+                ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2);
+                ctx.fillStyle = sig(out.value); ctx.fill();
+                ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke();
+            });
+        }
+
+        /* ─── DRAW CHIP ──────────────────────────────────────────── */
+        function drawChip(c) {
+            const def = BUILTIN[c.type] || customChips[c.type];
+            const col = def ? def.color : '#6b7280';
+            const lw = 1 / CAM;
+            ctx.fillStyle = col;
+            ctx.beginPath(); ctx.roundRect(c.x, c.y, c.w, c.h, 7); ctx.fill();
+            if (c === selected) { ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2 / CAM; ctx.stroke(); }
+            ctx.fillStyle = '#fff';
+            ctx.font = `bold ${11 / CAM < 7 ? 7 : 11}px monospace`;
+            ctx.textAlign = 'center';
+            ctx.fillText(c.type, c.x + c.w / 2, c.y + c.h / 2 + 4);
+            c.ins.forEach((_, i) => {
+                const p = chipInPos(c, i);
+                ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2);
+                ctx.fillStyle = sig(c.ins[i]); ctx.fill();
+                ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke();
+            });
+            c.outs.forEach((_, i) => {
+                const p = chipOutPos(c, i);
+                ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2);
+                ctx.fillStyle = sig(c.outs[i]); ctx.fill();
+                ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke();
+            });
+        }
+
+        /* ─── DRAW WIRE ──────────────────────────────────────────── */
+        function drawWire(w) {
+            const from = wireFromPos(w.from);
+            const to = wireToPos(w.to);
+            let val = 0;
+            if (w.from.kind === 'frame-in') val = frame.inputs[w.from.idx].value;
+            else val = w.from.node.outs[w.from.pin] || 0;
+            const mx = (from.x + to.x) / 2;
+            ctx.beginPath(); ctx.moveTo(from.x, from.y);
+            ctx.bezierCurveTo(mx, from.y, mx, to.y, to.x, to.y);
+            ctx.strokeStyle = val ? '#16a34a' : '#9ca3af';
+            ctx.lineWidth = 2 / CAM;
+            ctx.shadowColor = val ? '#22c55e' : 'transparent';
+            ctx.shadowBlur = val ? 5 / CAM : 0;
+            ctx.stroke(); ctx.shadowBlur = 0;
+        }
+
+        /* ─── DRAW ───────────────────────────────────────────────── */
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.setTransform(CAM, 0, 0, CAM, panX, panY);
+
+            // Grid
+            const wx0 = -panX / CAM, wy0 = -panY / CAM;
+            const wx1 = (canvas.width - panX) / CAM, wy1 = (canvas.height - panY) / CAM;
+            const gx0 = Math.floor(wx0 / 24) * 24, gy0 = Math.floor(wy0 / 24) * 24;
+            ctx.strokeStyle = '#e5e7eb'; ctx.lineWidth = 1 / CAM;
+            for (let x = gx0; x < wx1 + 24; x += 24) { ctx.beginPath(); ctx.moveTo(x, wy0); ctx.lineTo(x, wy1); ctx.stroke(); }
+            for (let y = gy0; y < wy1 + 24; y += 24) { ctx.beginPath(); ctx.moveTo(wx0, y); ctx.lineTo(wx1, y); ctx.stroke(); }
+
+            drawFrame();
+            wires.forEach(drawWire);
+            chips.forEach(drawChip);
+
+            // Pending wire
+            if (wireFrom) {
+                const from = wireFrom.kind === 'frame-in' ? frameInPinPos(wireFrom.idx) : chipOutPos(wireFrom.node, wireFrom.pin);
+                const mx = (from.x + MX) / 2;
+                ctx.beginPath(); ctx.moveTo(from.x, from.y);
+                ctx.bezierCurveTo(mx, from.y, mx, MY, MX, MY);
+                ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2 / CAM;
+                ctx.setLineDash([6 / CAM, 4 / CAM]); ctx.stroke(); ctx.setLineDash([]);
+            }
+            ctx.restore();
+        }
+
+        /* ─── HIT TESTING ────────────────────────────────────────── */
+        function hitFrameInPin(wx, wy) {
+            for (let i = 0; i < frame.inputs.length; i++) {
+                const p = frameInPinPos(i);
+                if (Math.hypot(wx - p.x, wy - p.y) < PIN_R + 8) return i;
+            }
+            return -1;
+        }
+        function hitFrameOutPin(wx, wy) {
+            for (let i = 0; i < frame.outputs.length; i++) {
+                const p = frameOutPinPos(i);
+                if (Math.hypot(wx - p.x, wy - p.y) < PIN_R + 8) return i;
+            }
+            return -1;
+        }
+        function hitFrameInputToggle(wx, wy) {
+            for (let i = 0; i < frame.inputs.length; i++) {
+                const py = frame.y + FRAME_HEAD + SLOT_H * i;
+                if (wx >= frame.x - SLOT_W && wx <= frame.x && wy >= py && wy < py + SLOT_H) return i;
+            }
+            return -1;
+        }
+        function hitFrameHead(wx, wy) {
+            return wx >= frame.x && wx <= frame.x + frame.w && wy >= frame.y && wy < frame.y + FRAME_HEAD;
+        }
+        function hitChipOut(wx, wy) {
+            for (const c of chips)
+                for (let i = 0; i < c.outs.length; i++) {
+                    const p = chipOutPos(c, i);
+                    if (Math.hypot(wx - p.x, wy - p.y) < PIN_R + 6) return { node: c, pin: i };
+                }
+            return null;
+        }
+        function hitChipIn(wx, wy) {
+            for (const c of chips)
+                for (let i = 0; i < c.ins.length; i++) {
+                    const p = chipInPos(c, i);
+                    if (Math.hypot(wx - p.x, wy - p.y) < PIN_R + 6) return { node: c, pin: i };
+                }
+            return null;
+        }
+        function hitChip(wx, wy) {
+            for (let i = chips.length - 1; i >= 0; i--) {
+                const c = chips[i];
+                if (wx >= c.x && wx <= c.x + c.w && wy >= c.y && wy <= c.y + c.h) return c;
+            }
+            return null;
+        }
+
+        /* ─── CONTEXT MENU ───────────────────────────────────────── */
+        let ctxEl = null;
+        function showCtx(sx, sy, items) {
+            hideCtx();
+            ctxEl = document.createElement('div');
+            Object.assign(ctxEl.style, {
+                position: 'fixed', left: Math.min(sx, window.innerWidth - 170) + 'px',
+                top: Math.min(sy, window.innerHeight - 220) + 'px',
+                background: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px',
+                boxShadow: '0 4px 16px rgba(0,0,0,.12)', zIndex: '9999',
+                minWidth: '150px', overflow: 'hidden', fontFamily: 'monospace', fontSize: '13px',
+            });
+            items.forEach(it => {
+                if (it === '-') {
+                    const s = document.createElement('div');
+                    Object.assign(s.style, { height: '1px', background: '#f3f4f6', margin: '2px 0' });
+                    ctxEl.appendChild(s);
+                } else {
+                    const el = document.createElement('div');
+                    el.textContent = it.label;
+                    Object.assign(el.style, {
+                        padding: '8px 14px', cursor: 'pointer',
+                        color: it.danger ? '#dc2626' : '#111827',
+                    });
+                    el.onmouseenter = () => el.style.background = '#f9fafb';
+                    el.onmouseleave = () => el.style.background = '';
+                    el.onclick = () => { hideCtx(); it.fn(); };
+                    ctxEl.appendChild(el);
+                }
+            });
+            document.body.appendChild(ctxEl);
+        }
+        function hideCtx() { if (ctxEl) { ctxEl.remove(); ctxEl = null; } }
+        document.addEventListener('click', hideCtx);
+
+        /* ─── MOUSE EVENTS ───────────────────────────────────────── */
+        canvas.addEventListener('mousedown', e => {
+            if (e.button === 1) { isPanning = true; panSX = e.clientX; panSY = e.clientY; panSPX = panX; panSPY = panY; e.preventDefault(); return; }
+            hideCtx();
+            const { x, y } = toWorld(e.offsetX, e.offsetY);
+
+            // Toggle input slot
+            const tog = hitFrameInputToggle(x, y);
+            if (tog >= 0) { frame.inputs[tog].value ^= 1; simulate(); draw(); return; }
+
+            // Start wire from frame-in pin
+            const fip = hitFrameInPin(x, y);
+            if (fip >= 0) { wireFrom = { kind: 'frame-in', idx: fip }; return; }
+
+            // Start wire from chip-out pin
+            const cop = hitChipOut(x, y);
+            if (cop) { wireFrom = { kind: 'chip', node: cop.node, pin: cop.pin }; return; }
+
+            // Finish wire
+            if (wireFrom) {
+                const fop = hitFrameOutPin(x, y);
+                if (fop >= 0) {
+                    if (wireFrom.kind !== 'frame-out') {
+                        wires = wires.filter(w => !(w.to.kind === 'frame-out' && w.to.idx === fop));
+                        wires.push({ from: wireFrom, to: { kind: 'frame-out', idx: fop } });
+                        wireFrom = null; simulate(); draw();
+                    } else { wireFrom = null; draw(); }
+                    return;
+                }
+                const cip = hitChipIn(x, y);
+                if (cip) {
+                    if (wireFrom.kind !== 'frame-out') {
+                        wires = wires.filter(w => !(w.to.kind === 'chip' && w.to.node === cip.node && w.to.pin === cip.pin));
+                        wires.push({ from: wireFrom, to: { kind: 'chip', node: cip.node, pin: cip.pin } });
+                        wireFrom = null; simulate(); draw();
+                    } else { wireFrom = null; draw(); }
+                    return;
+                }
+                wireFrom = null; draw(); return;
+            }
+
+            // Drag frame title
+            if (hitFrameHead(x, y)) { dragFrame = true; dragFx = x; dragFy = y; dragFpx = frame.x; dragFpy = frame.y; dragChipSnap = chips.map(c => ({ x: c.x, y: c.y })); return; }
+
+            // Drag chip
+            const c = hitChip(x, y);
+            if (c) { selected = c; dragChip = c; dragOx = x - c.x; dragOy = y - c.y; draw(); return; }
+            selected = null; draw();
+        });
+
+        canvas.addEventListener('mousemove', e => {
+            if (isPanning) { panX = panSPX + (e.clientX - panSX); panY = panSPY + (e.clientY - panSY); draw(); return; }
+            const w = toWorld(e.offsetX, e.offsetY); MX = w.x; MY = w.y;
+            if (dragFrame) { const dx = MX - dragFx, dy = MY - dragFy; frame.x = dragFpx + dx; frame.y = dragFpy + dy; chips.forEach((c, i) => { if (dragChipSnap[i]) { c.x = dragChipSnap[i].x + dx; c.y = dragChipSnap[i].y + dy; } }); simulate(); }
+            if (dragChip) { dragChip.x = MX - dragOx; dragChip.y = MY - dragOy; simulate(); }
+            if (dragFrame || dragChip || wireFrom) draw();
+        });
+        canvas.addEventListener('mouseup', e => {
+            if (e.button === 1) { isPanning = false; return; }
+            dragChip = null; dragFrame = false;
+        });
+        canvas.addEventListener('wheel', e => {
+            e.preventDefault();
+            const zf = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+            const wx = (e.offsetX - panX) / CAM, wy = (e.offsetY - panY) / CAM;
+            CAM = Math.max(0.1, Math.min(10, CAM * zf));
+            panX = e.offsetX - wx * CAM; panY = e.offsetY - wy * CAM; draw();
+        }, { passive: false });
+        canvas.addEventListener('contextmenu', e => {
+            e.preventDefault();
+            const { x, y } = toWorld(e.offsetX, e.offsetY);
+            if (wireFrom) { wireFrom = null; draw(); return; }
+            const c = hitChip(x, y);
+            if (c) {
+                selected = c; draw();
+                showCtx(e.clientX, e.clientY, [{ label: 'Delete chip', danger: true, fn: () => deleteSelected() }]);
+                return;
+            }
+            // Wire midpoint hit
+            for (let i = wires.length - 1; i >= 0; i--) {
+                const w = wires[i];
+                const fp = wireFromPos(w.from), tp = wireToPos(w.to);
+                if (Math.hypot(x - (fp.x + tp.x) / 2, y - (fp.y + tp.y) / 2) < 22 / CAM) {
+                    const wi = i;
+                    showCtx(e.clientX, e.clientY, [{ label: 'Delete wire', danger: true, fn: () => { wires.splice(wi, 1); simulate(); draw(); } }]);
+                    return;
+                }
+            }
+            showCtx(e.clientX, e.clientY, [
+                { label: 'AND', fn: () => place('AND', x, y) },
+                { label: 'OR', fn: () => place('OR', x, y) },
+                { label: 'NOT', fn: () => place('NOT', x, y) },
+                { label: 'NAND', fn: () => place('NAND', x, y) },
+                { label: 'XOR', fn: () => place('XOR', x, y) },
+                '-',
+                { label: '+ Input', fn: () => addInput() },
+                { label: '+ Output', fn: () => addOutput() },
+            ]);
+        });
+        document.addEventListener('keydown', e => {
+            if ((e.key === 'Delete' || e.key === 'Backspace') && selected) deleteSelected();
+            if (e.key === 'Escape') { wireFrom = null; selected = null; hideCtx(); draw(); }
+        });
+
+        /* ─── ACTIONS ────────────────────────────────────────────── */
+        function addInput() { frame.inputs.push({ id: nextId++, value: 0 }); simulate(); draw(); autoSave(); }
+        function addOutput() { frame.outputs.push({ id: nextId++, value: 0 }); simulate(); draw(); autoSave(); }
+        function place(type, wx, wy) {
+            if (wx === undefined) { wx = frame.x + frame.w / 2 - 44; wy = frame.y + FRAME_HEAD + frame.h / 2 - 20; }
+            const def = BUILTIN[type] || customChips[type];
+            const nin = def ? def.inputs : 2;
+            const h = Math.max(nin, 1) * 28 + 20;
+            chips.push({ id: nextId++, type, x: wx - 44, y: wy - h / 2, w: 88, h, ins: Array(nin).fill(0), outs: [0] });
+            simulate(); draw(); autoSave();
+        }
+        function deleteSelected() {
+            if (!selected) return;
+            wires = wires.filter(w => !(w.from.kind === 'chip' && w.from.node === selected) && !(w.to.kind === 'chip' && w.to.node === selected));
+            chips = chips.filter(c => c !== selected);
+            selected = null; simulate(); draw(); autoSave();
+        }
+        function newCanvas() {
+            chips = []; wires = []; frame.inputs = []; frame.outputs = [];
+            selected = null; wireFrom = null; simulate(); draw(); autoSave();
+        }
+        function saveChip() {
+            const name = prompt('Chip name:');
+            if (!name) return;
+            const snap = {
+                frame: JSON.parse(JSON.stringify({ inputs: frame.inputs, outputs: frame.outputs })),
+                chips: JSON.parse(JSON.stringify(chips)),
+                wires: wires.map(w => ({
+                    from: w.from.kind === 'frame-in' ? { kind: 'frame-in', idx: w.from.idx } : { kind: 'chip', nodeId: w.from.node.id, pin: w.from.pin },
+                    to: w.to.kind === 'frame-out' ? { kind: 'frame-out', idx: w.to.idx } : { kind: 'chip', nodeId: w.to.node.id, pin: w.to.pin },
+                })),
+            };
+            customChips[name] = {
+                color: '#7c3aed', inputs: frame.inputs.length, outputs: frame.outputs.length, snap,
+                fn: ins => simSnap(snap, ins),
+            };
+            rebuildChipBar(); autoSave();
+        }
+        function simSnap(snap, inputVals) {
+            const ns = JSON.parse(JSON.stringify(snap.chips));
+            const fi = JSON.parse(JSON.stringify(snap.frame.inputs));
+            fi.forEach((f, i) => { f.value = inputVals[i] || 0; });
+            const fo = JSON.parse(JSON.stringify(snap.frame.outputs));
+            const ws = snap.wires.map(w => ({
+                from: w.from.kind === 'frame-in' ? { kind: 'frame-in', idx: w.from.idx } : { kind: 'chip', node: ns.find(n => n.id === w.from.nodeId), pin: w.from.pin },
+                to: w.to.kind === 'frame-out' ? { kind: 'frame-out', idx: w.to.idx } : { kind: 'chip', node: ns.find(n => n.id === w.to.nodeId), pin: w.to.pin },
+            })).filter(w => (w.from.kind === 'frame-in' || w.from.node) && (w.to.kind === 'frame-out' || w.to.node));
+            for (let pass = 0; pass < 12; pass++) {
+                for (const w of ws) {
+                    let val = 0;
+                    if (w.from.kind === 'frame-in') val = fi[w.from.idx].value;
+                    else val = w.from.node.outs[w.from.pin] || 0;
+                    if (w.to.kind === 'frame-out') fo[w.to.idx].value = val;
+                    else w.to.node.ins[w.to.pin] = val;
+                }
+                for (const n of ns) {
+                    const def = BUILTIN[n.type] || (customChips[n.type] && { fn: customChips[n.type].fn });
+                    if (def) n.outs = def.fn(n.ins);
+                }
+            }
+            return fo.map(o => o.value);
+        }
+        function rebuildChipBar() {
+            const bar = document.getElementById('chip-bar');
+            bar.innerHTML = '<span style="color:#9ca3af;font-size:11px">CUSTOM:</span>';
+            Object.keys(customChips).forEach(name => {
+                const btn = document.createElement('button');
+                btn.className = 'btn'; btn.style.background = '#7c3aed'; btn.style.fontSize = '11px';
+                btn.textContent = name; btn.onclick = () => place(name);
+                bar.appendChild(btn);
+            });
+        }
+
+        /* ─── SAVE / LOAD ─────────────────────────────────────────── */
+        function getSaveData() {
+            return {
+                nextId, frame: { ...frame, inputs: [...frame.inputs], outputs: [...frame.outputs] },
+                chips: chips.map(c => ({ ...c, ins: [...c.ins], outs: [...c.outs] })),
+                wires: wires.map(w => ({
+                    from: w.from.kind === 'frame-in' ? { kind: 'frame-in', idx: w.from.idx } : { kind: 'chip', nodeId: w.from.node.id, pin: w.from.pin },
+                    to: w.to.kind === 'frame-out' ? { kind: 'frame-out', idx: w.to.idx } : { kind: 'chip', nodeId: w.to.node.id, pin: w.to.pin },
+                })),
+                customChips: Object.fromEntries(Object.entries(customChips).map(([k, v]) =>
+                    [k, { color: v.color, inputs: v.inputs, outputs: v.outputs, snap: v.snap }])),
+                panX, panY, CAM,
+            };
+        }
+        function autoSave() { try { localStorage.setItem('nodecanvas2', JSON.stringify(getSaveData())); } catch (e) { } }
+        function tryLoad() {
+            try {
+                const raw = localStorage.getItem('nodecanvas2');
+                if (!raw) return false;
+                const s = JSON.parse(raw);
+                nextId = s.nextId || 1;
+                frame = { ...s.frame, inputs: s.frame.inputs || [], outputs: s.frame.outputs || [] };
+                chips = s.chips || [];
+                Object.entries(s.customChips || {}).forEach(([k, v]) => { customChips[k] = { ...v, fn: ins => simSnap(v.snap, ins) }; });
+                wires = (s.wires || []).map(w => ({
+                    from: w.from.kind === 'frame-in' ? { kind: 'frame-in', idx: w.from.idx } : { kind: 'chip', node: chips.find(c => c.id === w.from.nodeId), pin: w.from.pin },
+                    to: w.to.kind === 'frame-out' ? { kind: 'frame-out', idx: w.to.idx } : { kind: 'chip', node: chips.find(c => c.id === w.to.nodeId), pin: w.to.pin },
+                })).filter(w => (w.from.kind === 'frame-in' || w.from.node) && (w.to.kind === 'frame-out' || w.to.node));
+                panX = s.panX || 0; panY = s.panY || 0; CAM = s.CAM || 1;
+                rebuildChipBar(); return true;
+            } catch (e) { return false; }
+        }
+
+        /* ─── INIT ────────────────────────────────────────────────── */
+        window.addEventListener('load', () => {
+            resize();
+            if (!tryLoad()) {
+                // Default: center frame, two inputs, one output, AND chip
+                frame = { x: -200, y: -120, w: 400, h: 240, title: 'ROOT' };
+                frame.inputs = [{ id: nextId++, value: 0 }, { id: nextId++, value: 0 }];
+                frame.outputs = [{ id: nextId++, value: 0 }];
+                const c = viewCenter();
+                panX = c.sx; panY = c.sy;
+                function viewCenter() { return { sx: canvas.width / 2 - frame.w / 2 + 200, sy: canvas.height / 2 }; }
+                panX = canvas.width / 2; panY = canvas.height / 2; // center at (0,0) world
+                chips = [{ id: nextId++, type: 'AND', x: -30, y: -20, w: 88, h: 56, ins: [0, 0], outs: [0] }];
+                wires = [
+                    { from: { kind: 'frame-in', idx: 0 }, to: { kind: 'chip', node: chips[0], pin: 0 } },
+                    { from: { kind: 'frame-in', idx: 1 }, to: { kind: 'chip', node: chips[0], pin: 1 } },
+                    { from: { kind: 'chip', node: chips[0], pin: 0 }, to: { kind: 'frame-out', idx: 0 } },
+                ];
+                simulate(); draw();
+            } else { simulate(); draw(); }
+        });
+    </script>
+</body>
+
+</html>

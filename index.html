@@ -405,6 +405,9 @@
         const PIN_R = 6;
         let selected = null, dragChip = null, dragOx = 0, dragOy = 0;
         let wireStart = null, MX = 0, MY = 0;
+        let panX = 0, panY = 0, CAM = 1;
+        let isPanning = false, panSX = 0, panSY = 0, panSPX = 0, panSPY = 0;
+        function toWorld(sx, sy) { return { x: (sx - panX) / CAM, y: (sy - panY) / CAM }; }
 
         function resize() {
             const rect = canvas.getBoundingClientRect();
@@ -429,18 +432,18 @@
             if (slots[i]) {
                 const sr = slots[i].getBoundingClientRect();
                 const cr = canvas.getBoundingClientRect();
-                return { x: 0, y: sr.top + sr.height / 2 - cr.top };
+                return toWorld(0, sr.top + sr.height / 2 - cr.top);
             }
-            return { x: 0, y: 36 + i * 60 };
+            return toWorld(0, 36 + i * 60);
         }
         function outPanelPos(i) {
             const slots = document.querySelectorAll('#panel-right .pin-slot');
             if (slots[i]) {
                 const sr = slots[i].getBoundingClientRect();
                 const cr = canvas.getBoundingClientRect();
-                return { x: canvas.width, y: sr.top + sr.height / 2 - cr.top };
+                return toWorld(canvas.width, sr.top + sr.height / 2 - cr.top);
             }
-            return { x: canvas.width, y: 36 + i * 60 };
+            return toWorld(canvas.width, 36 + i * 60);
         }
 
         function drawChip(c) {
@@ -493,18 +496,24 @@
 
         function draw() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ctx.strokeStyle = '#e5e7eb'; ctx.lineWidth = 1;
-            for (let x = 0; x < canvas.width; x += 24) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke(); }
-            for (let y = 0; y < canvas.height; y += 24) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); }
+            ctx.save();
+            ctx.setTransform(CAM, 0, 0, CAM, panX, panY);
+            const lw = 1 / CAM;
+            const wx0 = -panX / CAM, wy0 = -panY / CAM;
+            const wx1 = (canvas.width - panX) / CAM, wy1 = (canvas.height - panY) / CAM;
+            const gx0 = Math.floor(wx0 / 24) * 24, gy0 = Math.floor(wy0 / 24) * 24;
+            ctx.strokeStyle = '#e5e7eb'; ctx.lineWidth = lw;
+            for (let x = gx0; x < wx1 + 24; x += 24) { ctx.beginPath(); ctx.moveTo(x, wy0); ctx.lineTo(x, wy1); ctx.stroke(); }
+            for (let y = gy0; y < wy1 + 24; y += 24) { ctx.beginPath(); ctx.moveTo(wx0, y); ctx.lineTo(wx1, y); ctx.stroke(); }
             const s = scene();
             s.inputs.forEach((inp, i) => {
                 const p = inPanelPos(i);
-                ctx.beginPath(); ctx.arc(0, p.y, PIN_R, 0, Math.PI * 2);
+                ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2);
                 ctx.fillStyle = signalCol(inp.value); ctx.fill();
             });
             s.outputs.forEach((out, i) => {
                 const p = outPanelPos(i);
-                ctx.beginPath(); ctx.arc(canvas.width, p.y, PIN_R, 0, Math.PI * 2);
+                ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2);
                 ctx.fillStyle = signalCol(out.value); ctx.fill();
             });
             s.wires.forEach(drawWire);
@@ -516,9 +525,10 @@
                 const mx = (from.x + MX) / 2;
                 ctx.beginPath(); ctx.moveTo(from.x, from.y);
                 ctx.bezierCurveTo(mx, from.y, mx, MY, MX, MY);
-                ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2;
-                ctx.setLineDash([5, 4]); ctx.stroke(); ctx.setLineDash([]);
+                ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2 / CAM;
+                ctx.setLineDash([5 / CAM, 4 / CAM]); ctx.stroke(); ctx.setLineDash([]);
             }
+            ctx.restore();
         }
 
         /* ── Hit testing ────────────────────────────────────────── */
@@ -611,7 +621,7 @@
 
         canvas.addEventListener('contextmenu', function (e) {
             e.preventDefault();
-            const x = e.offsetX, y = e.offsetY, s = scene();
+            const { x, y } = toWorld(e.offsetX, e.offsetY), s = scene();
             if (wireStart) { wireStart = null; draw(); return; }
             const c = hitChip(x, y);
             if (c) {
@@ -628,7 +638,7 @@
                 else { const p = inPanelPos(w.fromIdx); fx = p.x; fy = p.y; }
                 if (w.toType === 'chip' && w.to) { const p = pinIn(w.to, w.toPin); tx = p.x; ty = p.y; }
                 else { const p = outPanelPos(w.toIdx); tx = p.x; ty = p.y; }
-                if (Math.hypot(x - (fx + tx) / 2, y - (fy + ty) / 2) < 28) {
+                if (Math.hypot(x - (fx + tx) / 2, y - (fy + ty) / 2) < 28 / CAM) {
                     const wi = i;
                     showCtx(e.clientX, e.clientY, [{ label: 'Delete wire', danger: true, fn: function () { s.wires.splice(wi, 1); simulate(); draw(); } }]);
                     return;
@@ -645,7 +655,11 @@
 
         /* ── Mouse events ───────────────────────────────────────── */
         canvas.addEventListener('mousedown', function (e) {
-            const x = e.offsetX, y = e.offsetY;
+            if (e.button === 1) {
+                isPanning = true; panSX = e.clientX; panSY = e.clientY;
+                panSPX = panX; panSPY = panY; e.preventDefault(); return;
+            }
+            const { x, y } = toWorld(e.offsetX, e.offsetY);
             const co = hitChipOut(x, y);
             if (co) { wireStart = co; return; }
             const ip = hitInPin(x, y);
@@ -662,15 +676,34 @@
             draw();
         });
         canvas.addEventListener('dblclick', function (e) {
-            const c = hitChip(e.offsetX, e.offsetY);
+            const { x, y } = toWorld(e.offsetX, e.offsetY);
+            const c = hitChip(x, y);
             if (c && customChips[c.type]) enterChip(c.type);
         });
         canvas.addEventListener('mousemove', function (e) {
-            MX = e.offsetX; MY = e.offsetY;
+            if (isPanning) {
+                panX = panSPX + (e.clientX - panSX);
+                panY = panSPY + (e.clientY - panSY);
+                draw(); return;
+            }
+            const w = toWorld(e.offsetX, e.offsetY);
+            MX = w.x; MY = w.y;
             if (dragChip) { dragChip.x = MX - dragOx; dragChip.y = MY - dragOy; simulate(); }
             if (dragChip || wireStart) draw();
         });
-        canvas.addEventListener('mouseup', function () { dragChip = null; });
+        canvas.addEventListener('mouseup', function (e) {
+            if (e.button === 1) { isPanning = false; return; }
+            dragChip = null;
+        });
+        canvas.addEventListener('wheel', function (e) {
+            e.preventDefault();
+            const zf = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+            const wx = (e.offsetX - panX) / CAM, wy = (e.offsetY - panY) / CAM;
+            CAM = Math.max(0.15, Math.min(8, CAM * zf));
+            panX = e.offsetX - wx * CAM;
+            panY = e.offsetY - wy * CAM;
+            draw();
+        }, { passive: false });
         document.addEventListener('keydown', function (e) {
             if ((e.key === 'Delete' || e.key === 'Backspace') && selected) deleteSelected();
             if (e.key === 'Escape') { wireStart = null; selected = null; hideCtx(); draw(); }
