@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Node Canvas v4 — Recursive</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box
+        }
+
+        body {
+            background: #fff;
+            overflow: hidden;
+            font-family: monospace;
+            user-select: none
+        }
+
+        canvas {
+            display: block;
+            cursor: crosshair
+        }
+
+        #nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: rgba(255, 255, 255, .95);
+            border-bottom: 1px solid #e5e7eb;
+            padding: 5px 14px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 12px;
+            z-index: 20
+        }
+
+        .crumb {
+            cursor: pointer;
+            color: #6366f1;
+            padding: 2px 6px;
+            border-radius: 4px
+        }
+
+        .crumb:hover {
+            background: #f0f0ff
+        }
+
+        .crumb.active {
+            color: #111;
+            cursor: default
+        }
+
+        .sep {
+            color: #9ca3af
+        }
+
+        #chip-bar {
+            position: fixed;
+            bottom: 44px;
+            left: 0;
+            right: 0;
+            background: rgba(249, 250, 251, .95);
+            border-top: 1px solid #e5e7eb;
+            display: flex;
+            gap: 6px;
+            padding: 3px 14px;
+            align-items: center;
+            min-height: 28px
+        }
+
+        #toolbar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(255, 255, 255, .96);
+            border-top: 1px solid #d1d5db;
+            display: flex;
+            gap: 5px;
+            padding: 6px 14px;
+            align-items: center;
+            flex-wrap: wrap;
+            z-index: 10
+        }
+
+        .btn {
+            padding: 4px 11px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font: bold 12px monospace;
+            color: #fff
+        }
+
+        .btn:hover {
+            filter: brightness(1.15)
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="cvs"></canvas>
+    <div id="nav"><span class="crumb active" id="crumb-root">ROOT</span></div>
+    <div id="chip-bar"><span style="color:#9ca3af;font-size:11px">CUSTOM:</span></div>
+    <div id="toolbar">
+        <button class="btn" style="background:#15803d" onclick="act('ADD_PORT_IN')">+ IN</button>
+        <button class="btn" style="background:#b45309" onclick="act('ADD_PORT_OUT')">+ OUT</button>
+        <button class="btn" style="background:#6366f1" onclick="act('ADD_BOX')">+ BOX</button>
+        <div style="width:1px;height:20px;background:#d1d5db"></div>
+        <button class="btn" style="background:#1d4ed8" onclick="act('PLACE',{type:'AND'})">AND</button>
+        <button class="btn" style="background:#b91c1c" onclick="act('PLACE',{type:'NOT'})">NOT</button>
+        <button class="btn" style="background:#065f46" onclick="act('PLACE',{type:'NAND'})">NAND</button>
+        <button class="btn" style="background:#b45309" onclick="act('PLACE',{type:'OR'})">OR</button>
+        <button class="btn" style="background:#7c3aed" onclick="act('PLACE',{type:'XOR'})">XOR</button>
+        <div style="width:1px;height:20px;background:#d1d5db"></div>
+        <button class="btn" style="background:#4c1d95" onclick="act('SAVE_CHIP')">SAVE CHIP</button>
+        <button class="btn" style="background:#0f766e" onclick="act('NEW')">NEW</button>
+        <button class="btn" style="background:#991b1b" onclick="act('DELETE')">DELETE</button>
+        <span style="color:#9ca3af;font-size:11px;margin-left:auto">Scroll=zoom · MMB=pan · DblClick=enter box ·
+            Alt+drag=clone · Del=delete</span>
+    </div>
+    <script>
+        'use strict';
+
+        /* ── BUILTIN ─────────────────────────────────────────────── */
+        const BUILTIN = {
+            AND: { color: '#1d4ed8', inputs: 2, fn: v => [v[0] & v[1]] },
+            OR: { color: '#b45309', inputs: 2, fn: v => [v[0] | v[1]] },
+            NOT: { color: '#b91c1c', inputs: 1, fn: v => [v[0] ? 0 : 1] },
+            NAND: { color: '#065f46', inputs: 2, fn: v => [(v[0] & v[1]) ? 0 : 1] },
+            XOR: { color: '#7c3aed', inputs: 2, fn: v => [v[0] ^ v[1]] },
+        };
+        const custom = {};
+
+        /* ── DATA MODEL ──────────────────────────────────────────── */
+        // gate: {kind:'gate', id, type, x,y,w,h, ins[], outs[]}
+        // box:  {kind:'box',  id, title, x,y,w,h,
+        //         ports_in:[{id,value}], ports_out:[{id,value}],
+        //         ins[], outs[], children[], wires:[]}
+        // wire (inside box): {from:{kind:'port-in'|'child-out', idx?,childId?,pin?},
+        //                     to:  {kind:'port-out'|'child-in', idx?,childId?,pin?}}
+
+        let uid = 1;
+        function makeGate(type, x, y) {
+            const def = BUILTIN[type] || custom[type];
+            const nin = def ? def.inputs : 2;
+            const h = Math.max(nin, 1) * 28 + 20;
+            return { kind: 'gate', id: uid++, type, x, y, w: 88, h, ins: Array(nin).fill(0), outs: [0] };
+        }
+        function makeBox(title, x, y, w = 300, h = 220) {
+            return { kind: 'box', id: uid++, title, x, y, w, h, ports_in: [], ports_out: [], ins: [], outs: [], children: [], wires: [] };
+        }
+
+        /* ── STATE ───────────────────────────────────────────────── */
+        let root = makeBox('ROOT', -150, -110);
+        let path = [root];
+        const cur = () => path[path.length - 1];
+        const cameras = new Map(); // box.id → {x,y,scale}
+        function getCam() { return cameras.get(cur().id) || { x: cvs.width / 2, y: cvs.height / 2, scale: 1 }; }
+        function setCam(c) { cameras.set(cur().id, { ...getCam(), ...c }); }
+
+        let ui = { selection: new Set(), wireFrom: null, selBox: null, panning: null };
+        let _drag = null;
+
+        /* ── SIMULATION ──────────────────────────────────────────── */
+        function evalNode(n) {
+            if (n.kind === 'gate') { const d = BUILTIN[n.type] || (custom[n.type] && { fn: custom[n.type].fn }); if (d) n.outs = d.fn(n.ins); }
+            else runBoxSim(n);
+        }
+        function runBoxSim(box) {
+            box.ports_in.forEach((p, i) => { p.value = box.ins[i] || 0; });
+            for (let pass = 0; pass < 12; pass++) {
+                for (const w of box.wires) {
+                    let val = 0;
+                    if (w.from.kind === 'port-in') val = box.ports_in[w.from.idx]?.value || 0;
+                    else { const c = box.children.find(x => x.id === w.from.childId); if (c) val = c.outs[w.from.pin] || 0; }
+                    if (w.to.kind === 'port-out') { if (box.ports_out[w.to.idx]) box.ports_out[w.to.idx].value = val; }
+                    else { const c = box.children.find(x => x.id === w.to.childId); if (c) c.ins[w.to.pin] = val; }
+                }
+                for (const c of box.children) evalNode(c);
+            }
+            box.outs = box.ports_out.map(p => p.value);
+        }
+        function simulate() { root.ins = root.ports_in.map(p => p.value); runBoxSim(root); }
+
+        /* ── GEOMETRY ────────────────────────────────────────────── */
+        const SLOT_H = 44, SLOT_W = 60, FHEAD = 28, PIN_R = 6;
+        const cvs = document.getElementById('cvs');
+        const ctx = cvs.getContext('2d');
+        function toWorld(sx, sy, cam = getCam()) { return { x: (sx - cam.x) / cam.scale, y: (sy - cam.y) / cam.scale }; }
+        const sig = v => v ? '#16a34a' : '#9ca3af';
+
+        function portInPos(box, i) { return { x: box.x, y: box.y + FHEAD + SLOT_H * i + SLOT_H / 2 }; }
+        function portOutPos(box, i) { return { x: box.x + box.w, y: box.y + FHEAD + SLOT_H * i + SLOT_H / 2 }; }
+        function childInPin(c, pin) {
+            if (c.kind === 'gate') { const s = c.h / Math.max(c.ins.length, 1); return { x: c.x, y: c.y + s * pin + s / 2 }; }
+            const s = c.h / Math.max(c.ports_in.length || 1, 1); return { x: c.x, y: c.y + s * pin + s / 2 };
+        }
+        function childOutPin(c, pin) {
+            if (c.kind === 'gate') { const s = c.h / Math.max(c.outs.length, 1); return { x: c.x + c.w, y: c.y + s * pin + s / 2 }; }
+            const s = c.h / Math.max(c.ports_out.length || 1, 1); return { x: c.x + c.w, y: c.y + s * pin + s / 2 };
+        }
+        function snapNode(n) {
+            return { x: n.x, y: n.y, children: (n.children || []).map(c => snapNode(c)) };
+        }
+        function applySnap(n, snap, dx, dy) {
+            n.x = snap.x + dx; n.y = snap.y + dy;
+            (n.children || []).forEach((c, i) => { if (snap.children[i]) applySnap(c, snap.children[i], dx, dy); });
+        }
+        function wireFromPos(box, f) {
+            if (f.kind === 'port-in') return portInPos(box, f.idx);
+            const c = box.children.find(x => x.id === f.childId); return c ? childOutPin(c, f.pin) : null;
+        }
+        function wireToPos(box, t) {
+            if (t.kind === 'port-out') return portOutPos(box, t.idx);
+            const c = box.children.find(x => x.id === t.childId); return c ? childInPin(c, t.pin) : null;
+        }
+
+        /* ── RENDER ──────────────────────────────────────────────── */
+        function render() {
+            const cam = getCam();
+            ctx.clearRect(0, 0, cvs.width, cvs.height);
+            ctx.save();
+            ctx.setTransform(cam.scale, 0, 0, cam.scale, cam.x, cam.y);
+            renderGrid(cam);
+            renderCurrentBox(cam);
+            renderSelBox();
+            renderPendingWire();
+            ctx.restore();
+        }
+
+        function renderGrid(cam) {
+            const lw = 1 / cam.scale;
+            const wx0 = -cam.x / cam.scale, wy0 = -cam.y / cam.scale;
+            const wx1 = (cvs.width - cam.x) / cam.scale, wy1 = (cvs.height - cam.y) / cam.scale;
+            const gx = Math.floor(wx0 / 24) * 24, gy = Math.floor(wy0 / 24) * 24;
+            ctx.strokeStyle = '#e5e7eb'; ctx.lineWidth = lw;
+            for (let x = gx; x < wx1 + 24; x += 24) { ctx.beginPath(); ctx.moveTo(x, wy0); ctx.lineTo(x, wy1); ctx.stroke(); }
+            for (let y = gy; y < wy1 + 24; y += 24) { ctx.beginPath(); ctx.moveTo(wx0, y); ctx.lineTo(wx1, y); ctx.stroke(); }
+        }
+
+        function renderCurrentBox(cam) {
+            const box = cur(), lw = 1.5 / cam.scale;
+            // Frame boundary
+            ctx.shadowColor = 'rgba(0,0,0,.07)'; ctx.shadowBlur = 14 / cam.scale;
+            ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.roundRect(box.x, box.y, box.w, box.h, 10); ctx.fill();
+            ctx.shadowBlur = 0;
+            ctx.strokeStyle = '#6366f1'; ctx.lineWidth = lw * 1.5;
+            ctx.setLineDash([8 / cam.scale, 5 / cam.scale]);
+            ctx.beginPath(); ctx.roundRect(box.x, box.y, box.w, box.h, 10); ctx.stroke(); ctx.setLineDash([]);
+            // Title bar
+            ctx.fillStyle = '#6366f1'; ctx.beginPath(); ctx.roundRect(box.x, box.y, box.w, FHEAD, [10, 10, 0, 0]); ctx.fill();
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 13px monospace'; ctx.textAlign = 'left';
+            ctx.fillText(box.title, box.x + 12, box.y + FHEAD / 2 + 5);
+            // Port-in slots
+            box.ports_in.forEach((p, i) => {
+                const py = box.y + FHEAD + SLOT_H * i;
+                ctx.fillStyle = p.value ? '#dcfce7' : '#f8fafc';
+                ctx.beginPath(); ctx.roundRect(box.x - SLOT_W, py, SLOT_W, SLOT_H - 2, [6, 0, 0, 6]); ctx.fill();
+                ctx.strokeStyle = '#d1d5db'; ctx.lineWidth = lw; ctx.stroke();
+                ctx.beginPath(); ctx.arc(box.x - SLOT_W + 13, py + SLOT_H / 2, 7, 0, Math.PI * 2);
+                ctx.fillStyle = sig(p.value); ctx.fill();
+                ctx.fillStyle = '#374151'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+                ctx.fillText('IN' + i, box.x - SLOT_W / 2, py + SLOT_H / 2 + 4);
+                const pp = portInPos(box, i);
+                ctx.beginPath(); ctx.arc(pp.x, pp.y, PIN_R, 0, Math.PI * 2);
+                ctx.fillStyle = sig(p.value); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke();
+            });
+            // Port-out slots
+            box.ports_out.forEach((p, i) => {
+                const py = box.y + FHEAD + SLOT_H * i;
+                ctx.fillStyle = p.value ? '#fef9c3' : '#f8fafc';
+                ctx.beginPath(); ctx.roundRect(box.x + box.w, py, SLOT_W, SLOT_H - 2, [0, 6, 6, 0]); ctx.fill();
+                ctx.strokeStyle = '#d1d5db'; ctx.lineWidth = lw; ctx.stroke();
+                ctx.beginPath(); ctx.arc(box.x + box.w + SLOT_W - 13, py + SLOT_H / 2, 7, 0, Math.PI * 2);
+                ctx.fillStyle = p.value ? '#eab308' : '#9ca3af'; ctx.fill();
+                ctx.fillStyle = '#374151'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+                ctx.fillText('OUT' + i, box.x + box.w + SLOT_W / 2, py + SLOT_H / 2 + 4);
+                const pp = portOutPos(box, i);
+                ctx.beginPath(); ctx.arc(pp.x, pp.y, PIN_R, 0, Math.PI * 2);
+                ctx.fillStyle = sig(p.value); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke();
+            });
+            // Wires
+            box.wires.forEach(w => {
+                const fp = wireFromPos(box, w.from), tp = wireToPos(box, w.to);
+                if (!fp || !tp) return;
+                let val = 0;
+                if (w.from.kind === 'port-in') val = box.ports_in[w.from.idx]?.value || 0;
+                else { const c = box.children.find(x => x.id === w.from.childId); if (c) val = c.outs[w.from.pin] || 0; }
+                const mx = (fp.x + tp.x) / 2;
+                ctx.beginPath(); ctx.moveTo(fp.x, fp.y); ctx.bezierCurveTo(mx, fp.y, mx, tp.y, tp.x, tp.y);
+                ctx.strokeStyle = val ? '#16a34a' : '#9ca3af'; ctx.lineWidth = 2 / cam.scale;
+                ctx.shadowColor = val ? '#22c55e' : 'transparent'; ctx.shadowBlur = val ? 5 / cam.scale : 0;
+                ctx.stroke(); ctx.shadowBlur = 0;
+            });
+            // Children
+            box.children.forEach(c => renderChild(c, cam));
+        }
+
+        function renderChild(c, cam) {
+            const lw = 1 / cam.scale;
+            const isSelected = ui.selection.has(c.id);
+            if (c.kind === 'gate') {
+                const def = BUILTIN[c.type] || custom[c.type];
+                ctx.fillStyle = def ? def.color : '#6b7280';
+                ctx.beginPath(); ctx.roundRect(c.x, c.y, c.w, c.h, 7); ctx.fill();
+                if (isSelected) { ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2.5 / cam.scale; ctx.stroke(); }
+                ctx.fillStyle = '#fff'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center';
+                ctx.fillText(c.type, c.x + c.w / 2, c.y + c.h / 2 + 4);
+                c.ins.forEach((_, i) => { const p = childInPin(c, i); ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2); ctx.fillStyle = sig(c.ins[i]); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke(); });
+                c.outs.forEach((_, i) => { const p = childOutPin(c, i); ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2); ctx.fillStyle = sig(c.outs[i]); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke(); });
+            } else { // box child — render contents recursively
+                renderBoxNode(c, cam, isSelected, 0);
+            }
+        }
+
+        function renderBoxNode(c, cam, isSelected, depth) {
+            const lw = 1 / cam.scale;
+            ctx.save();
+            ctx.beginPath(); ctx.rect(c.x + lw, c.y + lw, c.w - lw * 2, c.h - lw * 2); ctx.clip();
+            const alpha = Math.min(0.05 + depth * 0.04, 0.18);
+            ctx.fillStyle = `rgba(230,228,255,${alpha})`; ctx.fillRect(c.x, c.y, c.w, c.h);
+            if (depth < 8) {
+                renderBoxWires(c, cam);
+                (c.children || []).forEach(ch => {
+                    if (ch.kind === 'gate') renderChild(ch, cam);
+                    else renderBoxNode(ch, cam, ui.selection.has(ch.id), depth + 1);
+                });
+            }
+            ctx.restore();
+            ctx.strokeStyle = isSelected ? '#f59e0b' : '#6366f1';
+            ctx.lineWidth = (isSelected ? 2.5 : 1.5) / cam.scale;
+            ctx.beginPath(); ctx.roundRect(c.x, c.y, c.w, c.h, 8); ctx.stroke();
+            ctx.fillStyle = isSelected ? '#f59e0b' : '#6366f1';
+            ctx.globalAlpha = 0.88;
+            ctx.beginPath(); ctx.roundRect(c.x, c.y, c.w, 22, [8, 8, 0, 0]); ctx.fill();
+            ctx.globalAlpha = 1;
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center';
+            ctx.fillText(c.title, c.x + c.w / 2, c.y + 15);
+            (c.ports_in || []).forEach((_, i) => { const p = childInPin(c, i); ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2); ctx.fillStyle = sig(c.ins[i] || 0); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke(); });
+            (c.ports_out || []).forEach((_, i) => { const p = childOutPin(c, i); ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2); ctx.fillStyle = sig(c.outs[i] || 0); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke(); });
+        }
+
+        function renderBoxWires(box, cam) {
+            (box.wires || []).forEach(w => {
+                const fp = wireFromPos(box, w.from), tp = wireToPos(box, w.to);
+                if (!fp || !tp) return;
+                let val = 0;
+                if (w.from.kind === 'port-in') val = box.ports_in[w.from.idx]?.value || 0;
+                else { const c = (box.children || []).find(x => x.id === w.from.childId); if (c) val = c.outs[w.from.pin] || 0; }
+                const mx = (fp.x + tp.x) / 2;
+                ctx.beginPath(); ctx.moveTo(fp.x, fp.y);
+                ctx.bezierCurveTo(mx, fp.y, mx, tp.y, tp.x, tp.y);
+                ctx.strokeStyle = val ? '#16a34a' : '#cbd5e1'; ctx.lineWidth = 1.5 / cam.scale;
+                ctx.shadowColor = val ? '#22c55e' : 'transparent'; ctx.shadowBlur = val ? 4 / cam.scale : 0;
+                ctx.stroke(); ctx.shadowBlur = 0;
+            });
+        }
+
+        function renderSelBox() {
+            if (!ui.selBox) return;
+            const { sx, sy, ex, ey } = ui.selBox, cam = getCam();
+            const x = Math.min(sx, ex), y = Math.min(sy, ey), w = Math.abs(ex - sx), h = Math.abs(ey - sy);
+            ctx.fillStyle = 'rgba(99,102,241,0.08)'; ctx.beginPath(); ctx.rect(x, y, w, h); ctx.fill();
+            ctx.strokeStyle = '#6366f1'; ctx.lineWidth = 1.5 / cam.scale;
+            ctx.setLineDash([5 / cam.scale, 3 / cam.scale]); ctx.stroke(); ctx.setLineDash([]);
+        }
+
+        function renderPendingWire() {
+            if (!ui.wireFrom) return;
+            const box = cur(), cam = getCam();
+            const fp = ui.wireFrom.kind === 'port-in' ? portInPos(box, ui.wireFrom.idx) :
+                (() => { const c = box.children.find(x => x.id === ui.wireFrom.childId); return c ? childOutPin(c, ui.wireFrom.pin) : null; })();
+            if (!fp) return;
+            ctx.beginPath(); ctx.moveTo(fp.x, fp.y);
+            ctx.bezierCurveTo((fp.x + ui.mx) / 2, fp.y, (fp.x + ui.mx) / 2, ui.my, ui.mx, ui.my);
+            ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2 / cam.scale;
+            ctx.setLineDash([6 / cam.scale, 4 / cam.scale]); ctx.stroke(); ctx.setLineDash([]);
+        }
+
+        /* ── HIT TESTING ─────────────────────────────────────────── */
+        function hitTest(wx, wy) {
+            const box = cur();
+            // Port-in pins
+            for (let i = 0; i < box.ports_in.length; i++) { const p = portInPos(box, i); if (Math.hypot(wx - p.x, wy - p.y) < PIN_R + 8) return { kind: 'port-in-pin', idx: i }; }
+            // Port-out pins
+            for (let i = 0; i < box.ports_out.length; i++) { const p = portOutPos(box, i); if (Math.hypot(wx - p.x, wy - p.y) < PIN_R + 8) return { kind: 'port-out-pin', idx: i }; }
+            // Child out pins
+            for (const c of box.children) for (let i = 0; i < (c.kind === 'gate' ? c.outs : c.ports_out).length; i++) { const p = childOutPin(c, i); if (Math.hypot(wx - p.x, wy - p.y) < PIN_R + 6) return { kind: 'child-out-pin', child: c, pin: i }; }
+            // Child in pins
+            for (const c of box.children) for (let i = 0; i < (c.kind === 'gate' ? c.ins : c.ports_in).length; i++) { const p = childInPin(c, i); if (Math.hypot(wx - p.x, wy - p.y) < PIN_R + 6) return { kind: 'child-in-pin', child: c, pin: i }; }
+            // Port-in toggle
+            for (let i = 0; i < box.ports_in.length; i++) { const py = box.y + FHEAD + SLOT_H * i; if (wx >= box.x - SLOT_W && wx < box.x && wy >= py && wy < py + SLOT_H) return { kind: 'port-toggle', idx: i }; }
+            // Frame head (drag)
+            if (wx >= box.x && wx <= box.x + box.w && wy >= box.y && wy < box.y + FHEAD) return { kind: 'frame-head' };
+            // Children (body)
+            for (let i = box.children.length - 1; i >= 0; i--) { const c = box.children[i]; if (wx >= c.x && wx <= c.x + c.w && wy >= c.y && wy <= c.y + c.h) return { kind: 'child', child: c }; }
+            // Wire midpoints
+            for (let i = box.wires.length - 1; i >= 0; i--) {
+                const w = box.wires[i], fp = wireFromPos(box, w.from), tp = wireToPos(box, w.to);
+                if (fp && tp && Math.hypot(wx - (fp.x + tp.x) / 2, wy - (fp.y + tp.y) / 2) < 20 / getCam().scale) return { kind: 'wire', idx: i };
+            }
+            return { kind: 'empty' };
+        }
+
+        /* ── ACTIONS ─────────────────────────────────────────────── */
+        function act(type, payload = {}) {
+            const box = cur();
+            switch (type) {
+                case 'ADD_PORT_IN': box.ports_in.push({ id: uid++, value: 0 }); box.ins.push(0); break;
+                case 'ADD_PORT_OUT': box.ports_out.push({ id: uid++, value: 0 }); box.outs.push(0); break;
+                case 'TOGGLE_PORT_IN': box.ports_in[payload.idx].value ^= 1; box.ins[payload.idx] = box.ports_in[payload.idx].value; break;
+                case 'PLACE': {
+                    const def = BUILTIN[payload.type] || custom[payload.type];
+                    const nin = def ? def.inputs : 2; const h = Math.max(nin, 1) * 28 + 20;
+                    const x = payload.x ?? (box.x + box.w / 2 - 44), y = payload.y ?? (box.y + FHEAD + box.h / 2 - h / 2);
+                    box.children.push(payload.type && (BUILTIN[payload.type] || custom[payload.type]) ? makeGate(payload.type, x, y) : makeBox('BOX', x, y));
+                    break;
+                }
+                case 'ADD_BOX': {
+                    const w = 300, h = 200;
+                    const x = payload.x ?? (box.x + 50), y = payload.y ?? (box.y + FHEAD + 30);
+                    box.children.push(makeBox('BOX' + (uid), x, y, w, h)); break;
+                }
+                case 'ADD_WIRE': {
+                    box.wires = box.wires.filter(w => !(w.to.kind === payload.to.kind && w.to.idx === payload.to.idx && w.to.childId === payload.to.childId && w.to.pin === payload.to.pin));
+                    box.wires.push({ from: payload.from, to: payload.to }); break;
+                }
+                case 'DELETE_WIRE': box.wires.splice(payload.idx, 1); break;
+                case 'DELETE': {
+                    if (!ui.selection.size) return;
+                    const ids = new Set(ui.selection);
+                    box.wires = box.wires.filter(w => !(w.from.kind === 'child-out' && ids.has(w.from.childId)) && !(w.to.kind === 'child-in' && ids.has(w.to.childId)));
+                    box.children = box.children.filter(c => !ids.has(c.id));
+                    ui.selection.clear(); break;
+                }
+                case 'ENTER_BOX': path.push(payload.child); updateNav(); history.pushState({ depth: path.length - 1 }, ''); break;
+                case 'GO_TO': while (path.length > payload.depth + 1) path.pop(); updateNav(); break;
+                case 'NEW': box.children = []; box.wires = []; box.ports_in = []; box.ports_out = []; box.ins = []; box.outs = []; ui.selection.clear(); ui.wireFrom = null; break;
+                case 'SAVE_CHIP': {
+                    const name = prompt('Chip name:'); if (!name) return;
+                    const snap = JSON.parse(JSON.stringify(box));
+                    custom[name] = { color: '#7c3aed', inputs: box.ports_in.length, outputs: box.ports_out.length, snap, fn: ins => simSnap(snap, ins) };
+                    rebuildChipBar(); break;
+                }
+                case 'CAMERA': setCam(payload); break;
+            }
+            simulate(); render(); save();
+        }
+
+        /* ── CUSTOM CHIP SIM ─────────────────────────────────────── */
+        function simSnap(snap, inputVals) {
+            const s = JSON.parse(JSON.stringify(snap));
+            s.ports_in.forEach((p, i) => { p.value = inputVals[i] || 0; }); s.ins = s.ports_in.map(p => p.value);
+            runBoxSim(s); return s.ports_out.map(p => p.value);
+        }
+
+        /* ── NAV BREADCRUMB ──────────────────────────────────────── */
+        function updateNav() {
+            const nav = document.getElementById('nav'); nav.innerHTML = '';
+            path.forEach((b, i) => {
+                const sp = document.createElement('span'); sp.className = 'crumb' + (i === path.length - 1 ? ' active' : '');
+                sp.textContent = b.title; if (i < path.length - 1) sp.onclick = () => act('GO_TO', { depth: i });
+                nav.appendChild(sp);
+                if (i < path.length - 1) { const sep = document.createElement('span'); sep.className = 'sep'; sep.textContent = ' › '; nav.appendChild(sep); }
+            });
+        }
+
+        function rebuildChipBar() {
+            const bar = document.getElementById('chip-bar'); bar.innerHTML = '<span style="color:#9ca3af;font-size:11px">CUSTOM:</span>';
+            Object.keys(custom).forEach(name => {
+                const btn = document.createElement('button'); btn.className = 'btn'; btn.style.background = '#7c3aed'; btn.style.fontSize = '11px';
+                btn.textContent = name; btn.onclick = () => act('PLACE', { type: name }); bar.appendChild(btn);
+            });
+        }
+
+        /* ── MOUSE EVENTS ────────────────────────────────────────── */
+        ui.mx = 0; ui.my = 0;
+        let ctxEl = null;
+        function closeCtx() { if (ctxEl) { ctxEl.remove(); ctxEl = null; } }
+        function showCtx(sx, sy, items) {
+            closeCtx(); ctxEl = document.createElement('div');
+            Object.assign(ctxEl.style, {
+                position: 'fixed', left: Math.min(sx, window.innerWidth - 160) + 'px', top: Math.min(sy, window.innerHeight - 220) + 'px',
+                background: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px', boxShadow: '0 4px 16px rgba(0,0,0,.12)',
+                zIndex: '9999', minWidth: '140px', overflow: 'hidden', fontFamily: 'monospace', fontSize: '13px'
+            });
+            items.forEach(it => {
+                if (it === '-') { const s = document.createElement('div'); s.style.cssText = 'height:1px;background:#f3f4f6;margin:2px 0'; ctxEl.appendChild(s); return; }
+                const el = document.createElement('div'); el.textContent = it.label;
+                el.style.cssText = `padding:8px 14px;cursor:pointer;color:${it.danger ? '#dc2626' : '#111'}`;
+                el.onmouseenter = () => el.style.background = '#f9fafb'; el.onmouseleave = () => el.style.background = '';
+                el.onclick = () => { closeCtx(); it.fn(); }; ctxEl.appendChild(el);
+            });
+            document.body.appendChild(ctxEl);
+        }
+        document.addEventListener('click', closeCtx);
+
+        cvs.addEventListener('mousedown', e => {
+            if (e.button === 1) { ui.panning = { sx: e.clientX, sy: e.clientY, cx: getCam().x, cy: getCam().y }; e.preventDefault(); return; }
+            closeCtx();
+            const wb = toWorld(e.offsetX, e.offsetY), hit = hitTest(wb.x, wb.y), box = cur();
+            if (hit.kind === 'port-toggle') { act('TOGGLE_PORT_IN', { idx: hit.idx }); return; }
+            if (hit.kind === 'port-in-pin') { ui.wireFrom = { kind: 'port-in', idx: hit.idx }; return; }
+            if (hit.kind === 'child-out-pin') { ui.wireFrom = { kind: 'child-out', childId: hit.child.id, pin: hit.pin }; return; }
+            if (ui.wireFrom) {
+                let to = null;
+                if (hit.kind === 'port-out-pin') to = { kind: 'port-out', idx: hit.idx };
+                else if (hit.kind === 'child-in-pin') to = { kind: 'child-in', childId: hit.child.id, pin: hit.pin };
+                if (to) act('ADD_WIRE', { from: ui.wireFrom, to });
+                ui.wireFrom = null; render(); return;
+            }
+            if (hit.kind === 'frame-head') {
+                _drag = { kind: 'frame', fx: box.x, fy: box.y, mx: wb.x, my: wb.y, childSnaps: box.children.map(c => ({ id: c.id, snap: snapNode(c) })) }; return;
+            }
+            if (hit.kind === 'child') {
+                const c = hit.child;
+                if (e.altKey) {
+                    const clone = { ...JSON.parse(JSON.stringify(c)), id: uid++, x: c.x + 16, y: c.y + 16 };
+                    box.children.push(clone); ui.selection.clear(); ui.selection.add(clone.id);
+                    _drag = {
+                        kind: 'chips', startX: wb.x, startY: wb.y,
+                        nodeSnaps: [{ id: clone.id, snap: snapNode(clone) }]
+                    };
+                    simulate(); render(); return;
+                }
+                if (!e.shiftKey && !ui.selection.has(c.id)) ui.selection.clear();
+                ui.selection.add(c.id);
+                const nodeSnaps = [...ui.selection].map(id => { const ch = box.children.find(x => x.id === id); return ch ? { id, snap: snapNode(ch) } : null; }).filter(Boolean);
+                _drag = { kind: 'chips', startX: wb.x, startY: wb.y, nodeSnaps }; render(); return;
+            }
+            ui.selection.clear(); ui.selBox = { sx: wb.x, sy: wb.y, ex: wb.x, ey: wb.y }; render();
+        });
+
+        cvs.addEventListener('dblclick', e => {
+            const wb = toWorld(e.offsetX, e.offsetY), hit = hitTest(wb.x, wb.y);
+            if (hit.kind === 'child' && hit.child.kind === 'box') {
+                if (!cameras.has(hit.child.id)) {
+                    const c = hit.child; cameras.set(c.id, { x: cvs.width / 2 - (c.x + c.w / 2) * getCam().scale, y: cvs.height / 2 - (c.y + c.h / 2) * getCam().scale, scale: getCam().scale });
+                }
+                act('ENTER_BOX', { child: hit.child });
+            }
+        });
+
+        cvs.addEventListener('mousemove', e => {
+            if (ui.panning) { const cam = getCam(); setCam({ x: ui.panning.cx + (e.clientX - ui.panning.sx), y: ui.panning.cy + (e.clientY - ui.panning.sy) }); render(); return; }
+            const wb = toWorld(e.offsetX, e.offsetY); ui.mx = wb.x; ui.my = wb.y;
+            if (_drag?.kind === 'frame') {
+                const dx = wb.x - _drag.mx, dy = wb.y - _drag.my; const box = cur();
+                box.x = _drag.fx + dx; box.y = _drag.fy + dy;
+                _drag.childSnaps.forEach(({ id, snap }) => { const c = box.children.find(x => x.id === id); if (c) applySnap(c, snap, dx, dy); });
+                simulate(); render(); return;
+            }
+            if (_drag?.kind === 'chips') { const box = cur(); const dx = wb.x - _drag.startX, dy = wb.y - _drag.startY; _drag.nodeSnaps.forEach(({ id, snap }) => { const c = box.children.find(x => x.id === id); if (c) applySnap(c, snap, dx, dy); }); simulate(); render(); return; }
+            if (ui.selBox) { ui.selBox.ex = wb.x; ui.selBox.ey = wb.y; render(); return; }
+            if (ui.wireFrom) render();
+        });
+
+        cvs.addEventListener('mouseup', e => {
+            if (e.button === 1) { ui.panning = null; return; }
+            if (ui.selBox) {
+                const { sx, sy, ex, ey } = ui.selBox; const box = cur();
+                const x1 = Math.min(sx, ex), y1 = Math.min(sy, ey), x2 = Math.max(sx, ex), y2 = Math.max(sy, ey);
+                if (x2 - x1 > 4 || y2 - y1 > 4) box.children.forEach(c => { if (c.x >= x1 && c.x + c.w <= x2 && c.y >= y1 && c.y + c.h <= y2) ui.selection.add(c.id); });
+                ui.selBox = null; render();
+            }
+            _drag = null; save();
+        });
+
+        cvs.addEventListener('wheel', e => {
+            e.preventDefault(); const cam = getCam(); const zf = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+            const wx = (e.offsetX - cam.x) / cam.scale, wy = (e.offsetY - cam.y) / cam.scale;
+            const ns = Math.max(0.1, Math.min(12, cam.scale * zf));
+            setCam({ scale: ns, x: e.offsetX - wx * ns, y: e.offsetY - wy * ns }); render();
+        }, { passive: false });
+
+        cvs.addEventListener('contextmenu', e => {
+            e.preventDefault(); const wb = toWorld(e.offsetX, e.offsetY), hit = hitTest(wb.x, wb.y);
+            if (ui.wireFrom) { ui.wireFrom = null; render(); return; }
+            if (hit.kind === 'child') {
+                if (!ui.selection.has(hit.child.id)) { ui.selection.clear(); ui.selection.add(hit.child.id); }
+                render();
+                const items = [{ label: 'Delete', danger: true, fn: () => act('DELETE') }];
+                if (hit.child.kind === 'box') items.unshift({ label: 'Enter box', fn: () => act('ENTER_BOX', { child: hit.child }) });
+                showCtx(e.clientX, e.clientY, items); return;
+            }
+            if (hit.kind === 'wire') { const wi = hit.idx; showCtx(e.clientX, e.clientY, [{ label: 'Delete wire', danger: true, fn: () => act('DELETE_WIRE', { idx: wi }) }]); return; }
+            showCtx(e.clientX, e.clientY, [
+                { label: 'AND', fn: () => act('PLACE', { type: 'AND', x: wb.x - 44, y: wb.y - 28 }) },
+                { label: 'OR', fn: () => act('PLACE', { type: 'OR', x: wb.x - 44, y: wb.y - 28 }) },
+                { label: 'NOT', fn: () => act('PLACE', { type: 'NOT', x: wb.x - 44, y: wb.y - 28 }) },
+                { label: 'NAND', fn: () => act('PLACE', { type: 'NAND', x: wb.x - 44, y: wb.y - 28 }) },
+                { label: 'XOR', fn: () => act('PLACE', { type: 'XOR', x: wb.x - 44, y: wb.y - 28 }) },
+                '-',
+                { label: '+ Input', fn: () => act('ADD_PORT_IN') },
+                { label: '+ Output', fn: () => act('ADD_PORT_OUT') },
+                { label: '+ Box', fn: () => act('ADD_BOX', { x: wb.x, y: wb.y }) },
+            ]);
+        });
+
+        document.addEventListener('keydown', e => {
+            if ((e.key === 'Delete' || e.key === 'Backspace') && ui.selection.size) act('DELETE');
+            if (e.key === 'Escape') {
+                if (path.length > 1) { path.pop(); updateNav(); }
+                ui.wireFrom = null; ui.selection.clear(); ui.selBox = null; closeCtx(); render();
+            }
+        });
+
+        /* ── PERSISTENCE ─────────────────────────────────────────── */
+        function save() {
+            try {
+                const camObj = {}; cameras.forEach((v, k) => camObj[k] = v);
+                localStorage.setItem('nc4', JSON.stringify({
+                    uid, root, cameras: camObj,
+                    custom: Object.fromEntries(Object.entries(custom).map(([k, v]) => [k, { color: v.color, inputs: v.inputs, outputs: v.outputs, snap: v.snap }]))
+                }));
+            } catch (e) { }
+        }
+        function load() {
+            try {
+                const raw = localStorage.getItem('nc4'); if (!raw) return false;
+                const s = JSON.parse(raw); uid = s.uid || 1; root = s.root; path = [root];
+                if (s.cameras) Object.entries(s.cameras).forEach(([k, v]) => cameras.set(Number(k), v));
+                Object.entries(s.custom || {}).forEach(([k, v]) => custom[k] = { ...v, fn: ins => simSnap(v.snap, ins) });
+                rebuildChipBar(); updateNav(); return true;
+            } catch (e) { return false; }
+        }
+
+        /* ── INIT ────────────────────────────────────────────────── */
+        function resize() { cvs.width = window.innerWidth; cvs.height = window.innerHeight; render(); }
+        window.addEventListener('resize', resize);
+
+        window.addEventListener('popstate', () => {
+            if (path.length > 1) { path.pop(); updateNav(); render(); }
+        });
+
+        window.addEventListener('load', () => {
+            resize();
+            if (!load()) {
+                cameras.set(root.id, { x: cvs.width / 2, y: cvs.height / 2, scale: 1 });
+                act('ADD_PORT_IN'); act('ADD_PORT_IN'); act('ADD_PORT_OUT');
+                const g = makeGate('AND', root.x + root.w / 2 - 44, root.y + FHEAD + root.h / 2 - 28);
+                root.children.push(g);
+                root.wires = [
+                    { from: { kind: 'port-in', idx: 0 }, to: { kind: 'child-in', childId: g.id, pin: 0 } },
+                    { from: { kind: 'port-in', idx: 1 }, to: { kind: 'child-in', childId: g.id, pin: 1 } },
+                    { from: { kind: 'child-out', childId: g.id, pin: 0 }, to: { kind: 'port-out', idx: 0 } },
+                ];
+                simulate(); render(); save();
+            } else { simulate(); render(); }
+        });
+    </script>
+</body>
+
+</html>

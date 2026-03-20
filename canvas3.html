@@ -120,7 +120,7 @@
 
         // Transient pointer state (never saved)
         const ptr = { down: false, x: 0, y: 0, button: 0 };
-        let ui = { selected: null, wireFrom: null, drag: null };
+        let ui = { selection: new Set(), wireFrom: null, drag: null, selBox: null };
 
         /* ═══════════════════════════════════════════════════════════
            GEOMETRY HELPERS
@@ -232,14 +232,14 @@
                     break;
 
                 case 'DELETE': {
-                    if (!ui.selected) return;
-                    const id = ui.selected;
+                    if (!ui.selection.size) return;
+                    const ids = new Set(ui.selection);
                     state.wires = state.wires.filter(w =>
-                        !(w.from.kind === 'chip' && w.from.chipId === id) &&
-                        !(w.to.kind === 'chip' && w.to.chipId === id)
+                        !(w.from.kind === 'chip' && ids.has(w.from.chipId)) &&
+                        !(w.to.kind === 'chip' && ids.has(w.to.chipId))
                     );
-                    state.chips = state.chips.filter(c => c.id !== id);
-                    ui.selected = null;
+                    state.chips = state.chips.filter(c => !ids.has(c.id));
+                    ui.selection.clear();
                     break;
                 }
 
@@ -248,7 +248,7 @@
                     state.wires = [];
                     state.inputs = [];
                     state.outputs = [];
-                    ui.selected = null;
+                    ui.selection.clear();
                     ui.wireFrom = null;
                     break;
 
@@ -291,6 +291,7 @@
             renderFrame(frame, inputs, outputs);
             wires.forEach((w, i) => renderWire(state, w, i));
             chips.forEach(c => renderChip(c));
+            renderSelectionBox();
             renderPendingWire(state);
 
             ctx.restore();
@@ -362,7 +363,7 @@
             const def = defFor(c.type);
             ctx.fillStyle = def ? def.color : '#6b7280';
             ctx.beginPath(); ctx.roundRect(c.x, c.y, c.w, c.h, 7); ctx.fill();
-            if (c.id === ui.selected) { ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2.5 / cam.scale; ctx.stroke(); }
+            if (ui.selection.has(c.id)) { ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2.5 / cam.scale; ctx.stroke(); }
             ctx.fillStyle = '#fff'; ctx.font = `bold 11px monospace`; ctx.textAlign = 'center';
             ctx.fillText(c.type, c.x + c.w / 2, c.y + c.h / 2 + 4);
             c.ins.forEach((_, i) => { const p = chipInPin(c, i); ctx.beginPath(); ctx.arc(p.x, p.y, PIN_R, 0, Math.PI * 2); ctx.fillStyle = sig(c.ins[i]); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = lw; ctx.stroke(); });
@@ -391,6 +392,17 @@
             ctx.beginPath(); ctx.moveTo(fp.x, fp.y); ctx.bezierCurveTo((fp.x + ui.mx) / 2, fp.y, (fp.x + ui.mx) / 2, ui.my, ui.mx, ui.my);
             ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2 / cam.scale;
             ctx.setLineDash([6 / cam.scale, 4 / cam.scale]); ctx.stroke(); ctx.setLineDash([]);
+        }
+
+        function renderSelectionBox() {
+            if (!ui.selBox) return;
+            const { sx, sy, ex, ey } = ui.selBox;
+            const cam = state.camera;
+            const x = Math.min(sx, ex), y = Math.min(sy, ey), w = Math.abs(ex - sx), h = Math.abs(ey - sy);
+            ctx.fillStyle = 'rgba(99,102,241,0.08)';
+            ctx.beginPath(); ctx.rect(x, y, w, h); ctx.fill();
+            ctx.strokeStyle = '#6366f1'; ctx.lineWidth = 1.5 / cam.scale;
+            ctx.setLineDash([5 / cam.scale, 3 / cam.scale]); ctx.stroke(); ctx.setLineDash([]);
         }
 
         /* ═══════════════════════════════════════════════════════════
@@ -476,11 +488,25 @@
                 return;
             }
             if (hit.kind === 'chip') {
-                ui.selected = hit.chip.id;
-                _dragOrigin = { kind: 'chip', id: hit.chip.id, ox: wb.x - hit.chip.x, oy: wb.y - hit.chip.y };
+                if (e.altKey) {
+                    // Alt+drag = clone
+                    const src = hit.chip;
+                    const clone = { ...JSON.parse(JSON.stringify(src)), id: uid++, x: src.x + 16, y: src.y + 16 };
+                    state.chips.push(clone);
+                    ui.selection.clear(); ui.selection.add(clone.id);
+                    _dragOrigin = { kind: 'chips', offsets: [{ id: clone.id, ox: wb.x - clone.x, oy: wb.y - clone.y }] };
+                    simulate(state); render(state); return;
+                }
+                if (!e.shiftKey && !ui.selection.has(hit.chip.id)) ui.selection.clear();
+                ui.selection.add(hit.chip.id);
+                const offsets = [...ui.selection].map(id => { const c = chipById(state, id); return c ? { id, ox: wb.x - c.x, oy: wb.y - c.y } : null; }).filter(Boolean);
+                _dragOrigin = { kind: 'chips', offsets };
                 render(state); return;
             }
-            ui.selected = null; render(state);
+            // Empty: start selection box
+            ui.selection.clear();
+            ui.selBox = { sx: wb.x, sy: wb.y, ex: wb.x, ey: wb.y };
+            render(state);
         });
 
         cvs.addEventListener('mousemove', e => {
@@ -499,16 +525,23 @@
                 _dragOrigin.chipSnap.forEach(snap => { const c = chipById(state, snap.id); if (c) { c.x = snap.x + dx; c.y = snap.y + dy; } });
                 simulate(state); render(state); save(state); return;
             }
-            if (_dragOrigin?.kind === 'chip') {
-                const c = chipById(state, _dragOrigin.id);
-                if (c) { c.x = wb.x - _dragOrigin.ox; c.y = wb.y - _dragOrigin.oy; simulate(state); render(state); save(state); }
-                return;
+            if (_dragOrigin?.kind === 'chips') {
+                _dragOrigin.offsets.forEach(({ id, ox, oy }) => { const c = chipById(state, id); if (c) { c.x = wb.x - ox; c.y = wb.y - oy; } });
+                simulate(state); render(state); save(state); return;
             }
+            if (ui.selBox) { ui.selBox.ex = wb.x; ui.selBox.ey = wb.y; render(state); return; }
             if (ui.wireFrom) render(state);
         });
 
         cvs.addEventListener('mouseup', e => {
             if (e.button === 1) { ui.drag = null; return; }
+            if (ui.selBox) {
+                const { sx, sy, ex, ey } = ui.selBox;
+                const x1 = Math.min(sx, ex), y1 = Math.min(sy, ey), x2 = Math.max(sx, ex), y2 = Math.max(sy, ey);
+                if (x2 - x1 > 4 || y2 - y1 > 4)
+                    state.chips.forEach(c => { if (c.x >= x1 && c.x + c.w <= x2 && c.y >= y1 && c.y + c.h <= y2) ui.selection.add(c.id); });
+                ui.selBox = null; render(state);
+            }
             _dragOrigin = null;
         });
 
@@ -552,7 +585,8 @@
             if (ui.wireFrom) { ui.wireFrom = null; render(state); return; }
             const hit = hitTest(state, wb.x, wb.y);
             if (hit.kind === 'chip') {
-                ui.selected = hit.chip.id; render(state);
+                if (!ui.selection.has(hit.chip.id)) { ui.selection.clear(); ui.selection.add(hit.chip.id); }
+                render(state);
                 showCtxMenu(e.clientX, e.clientY, [{ label: 'Delete chip', danger: true, fn: () => act('DELETE') }]); return;
             }
             if (hit.kind === 'wire') {
@@ -572,8 +606,8 @@
         });
 
         document.addEventListener('keydown', e => {
-            if ((e.key === 'Delete' || e.key === 'Backspace') && ui.selected) act('DELETE');
-            if (e.key === 'Escape') { ui.wireFrom = null; ui.selected = null; closeCtxMenu(); render(state); }
+            if ((e.key === 'Delete' || e.key === 'Backspace') && ui.selection.size) act('DELETE');
+            if (e.key === 'Escape') { ui.wireFrom = null; ui.selection.clear(); ui.selBox = null; closeCtxMenu(); render(state); }
         });
 
         /* ═══════════════════════════════════════════════════════════
